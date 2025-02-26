@@ -104,18 +104,117 @@ def get_clipseg_masks(model, processor, image, device):
     return stuff_mask, assigned_pixels
 
 def sample_points(mask, num_samples=10):
-    """Sample points from mask for SAM2 prompting"""
+    """Sample better points from mask for SAM2 prompting"""
     idx_points = torch.nonzero(mask, as_tuple=False)
     
     if idx_points.size(0) >= num_samples:
-        selected_indices = np.random.choice(idx_points.size(0), num_samples, replace=False)
-        selected_points = idx_points[selected_indices]
+        # Instead of pure random sampling, use distance-based sampling
+        # First select a random center point
+        if idx_points.size(0) > 0:
+            center_idx = np.random.choice(idx_points.size(0), 1)[0]
+            center_point = idx_points[center_idx]
+            
+            # Calculate distances from all points to this center
+            distances = torch.sum((idx_points.float() - center_point.float()) ** 2, dim=1)
+            
+            # Mix of central and boundary points
+            # Select some points closer to center
+            close_indices = torch.argsort(distances)[:num_samples//2]
+            
+            # Select some points farther from center (more likely to be on boundaries)
+            far_indices = torch.argsort(distances, descending=True)[:num_samples//2]
+            
+            # Combine both sets of indices
+            selected_indices = torch.cat([close_indices, far_indices])
+            selected_points = idx_points[selected_indices[:num_samples]]
+        else:
+            selected_points = torch.zeros(num_samples, 2, dtype=torch.int64)
     else:
-        # If fewer than num_samples valid points, pad with zeros
+        # If fewer than num_samples valid points, use what we have
         selected_points = torch.zeros(num_samples, 2, dtype=torch.int64)
         selected_points[:idx_points.size(0)] = idx_points
     
     return selected_points
+
+def predict_with_sam2(sam2_predictor, class_id, points, clipseg_mask, args, device):
+    """Get SAM2 prediction with improved point handling"""
+    # Convert points for SAM2 - handle coordinate system transformation if needed
+    # SAM2 expects points in (y, x) format while our points are in (x, y) format
+    sam_points = points.clone()
+    # Swap x and y for SAM2
+    sam_points = sam_points[:, [1, 0]].cpu().numpy()
+    
+    # Filter out zero points (which were padding)
+    valid_points = np.all(sam_points != 0, axis=1)
+    if not np.any(valid_points):
+        return clipseg_mask.float()  # If no valid points, just return CLIPSeg mask
+        
+    valid_sam_points = sam_points[valid_points]
+    
+    if len(valid_sam_points) > 0:
+        # Get SAM2 prediction with more specific parameters
+        try:
+            masks, scores, _ = sam2_predictor.predict(
+                point_coords=valid_sam_points,
+                point_labels=np.ones(len(valid_sam_points), dtype=np.int64),
+                multimask_output=True,  # Get multiple candidate masks
+                return_logits=True  # Get logits for better confidence assessment
+            )
+            
+            # Handle empty masks
+            if masks.shape[0] == 0:
+                return clipseg_mask.float()
+            
+            # Select best mask based on score
+            best_idx = np.argmax(scores)
+            sam_mask = torch.from_numpy(masks[best_idx:best_idx+1]).to(device)
+            
+            # Calculate IoU with CLIPSeg mask for adaptive fusion
+            intersection = (sam_mask.squeeze(0) & clipseg_mask.bool()).float().sum()
+            union = (sam_mask.squeeze(0) | clipseg_mask.bool()).float().sum()
+            iou = intersection / union if union > 0 else 0.0
+            
+            # Adaptive fusion weight based on IoU and confidence
+            adaptive_weight = min(0.9, max(0.5, scores[best_idx] * (0.5 + 0.5 * iou)))
+            
+            # Class-specific weights
+            # Adjust weights based on class (some classes work better with SAM2, others with CLIPSeg)
+            class_weights = {
+                0: 0.7,  # road
+                1: 0.7,  # sidewalk
+                2: 0.8,  # building
+                3: 0.7,  # wall
+                4: 0.6,  # fence
+                5: 0.4,  # pole (thin structures better with CLIPSeg)
+                6: 0.4,  # traffic light (thin structures)
+                7: 0.4,  # traffic sign
+                8: 0.7,  # vegetation
+                9: 0.6,  # terrain
+                10: 0.8  # sky
+            }
+            
+            # Apply fusion mode with class-specific tuning
+            if args.fusion_mode == "union":
+                fused_mask = (sam_mask.squeeze(0) | clipseg_mask.bool()).float()
+            elif args.fusion_mode == "intersection":
+                fused_mask = (sam_mask.squeeze(0) & clipseg_mask.bool()).float()
+            elif args.fusion_mode == "weighted":
+                # Use class and quality specific weighting
+                class_weight = class_weights.get(class_id, args.sam_weight) * adaptive_weight
+                fused_mask = (class_weight * sam_mask.squeeze(0).float() + 
+                             (1 - class_weight) * clipseg_mask).float()
+                fused_mask = (fused_mask > 0.5).float()  # Threshold
+            elif args.fusion_mode == "clipseg_only":
+                fused_mask = clipseg_mask.float()
+            else:  # sam_only
+                fused_mask = sam_mask.squeeze(0).float()
+            
+            return fused_mask
+        except Exception as e:
+            print(f"Error in SAM2 prediction for class {class_id}: {e}")
+            return clipseg_mask.float()
+    else:
+        return clipseg_mask.float()
 
 def colorize_mask(mask):
     """Convert mask to RGB visualization"""
@@ -207,13 +306,8 @@ def evaluate_cityscapes_val(args):
         city = path_parts[-2]
         file_name = path_parts[-1]
         image_id = file_name.replace("_leftImg8bit.png", "")
-
-
-        #leftImg8bit: /media/avalocal/T7/pardis/pardis/perception_system/datasets/cityscapes_complete/leftImg8bit/val/lindau/lindau_000000_000019_leftImg8bit.png
-        #gtFine:      /media/avalocal/T7/pardis/pardis/perception_system/datasets/cityscapes_complete/gtFine/val/lindau/lindau_000000_000019_gtFine_labelIds.png
         
         # Load ground truth
-        # gt_path = image_path.replace("leftImg8bit", "gtFine").replace("_leftImg8bit.png", "_gtFine_labelIds.png")
         gt_path = image_path.replace("_leftImg8bit.png", "_gtFine_labelIds.png").replace("leftImg8bit", "gtFine")
         if not os.path.exists(gt_path):
             print(f"Warning: Ground truth not found for {image_path}")
@@ -233,57 +327,34 @@ def evaluate_cityscapes_val(args):
             clipseg_model, processor, np_image, device
         )
         
-        # Sample points for each class from CLIPSeg masks
-        num_samples = args.num_samples
-        points = torch.zeros(len(STUFF_CLASSES), num_samples, 2)
-        
-        for i in range(len(STUFF_CLASSES)):
-            selected_points = sample_points(clipseg_mask[i], num_samples=num_samples)
-            points[i] = selected_points
-        
-        # Step 2: Use SAM2 to refine masks using the sampled points
+        # Set SAM2 image once for efficiency
         sam2_predictor.set_image(np_image)
+        
+        # Create array for final combined mask
         combined_mask = torch.zeros((len(STUFF_CLASSES), 1024, 2048), device=device)
         
+        # Process each class separately
         for i in range(len(STUFF_CLASSES)):
-            # Convert points format: swap x, y to y, x for SAM2
-            coords = points[i].clone()
-            sam_points = coords[:, [1, 0]].cpu().numpy()  # Swap coordinates for SAM2
-            
-            # Filter out zero points (which were padding)
-            valid_points = np.all(sam_points != 0, axis=1)
-            if not np.any(valid_points):
-                continue  # Skip if no valid points
+            # Skip classes with almost no pixels in CLIPSeg mask
+            if clipseg_mask[i].sum() < 100:
+                # For very sparse classes, stick with CLIPSeg
+                combined_mask[i] = clipseg_mask[i]
+                continue
                 
-            valid_sam_points = sam_points[valid_points]
+            # Sample better points for SAM2
+            selected_points = sample_points(clipseg_mask[i], num_samples=args.num_samples)
             
-            if len(valid_sam_points) > 0:
-                # Get SAM2 prediction
-                masks, scores, _ = sam2_predictor.predict(
-                    point_coords=valid_sam_points,
-                    point_labels=np.ones(len(valid_sam_points), dtype=np.int64),
-                    multimask_output=False,
-                )
-                
-                # Process SAM2 mask
-                if masks.shape[0] > 0:  # Check if any masks were returned
-                    sam_mask = torch.from_numpy(masks).to(device)
-                    
-                    # Apply the selected fusion mode
-                    if args.fusion_mode == "union":
-                        fused_mask = (sam_mask.squeeze(0) | clipseg_mask[i].bool()).float()
-                    elif args.fusion_mode == "intersection":
-                        fused_mask = (sam_mask.squeeze(0) & clipseg_mask[i].bool()).float()
-                    elif args.fusion_mode == "weighted":
-                        fused_mask = (args.sam_weight * sam_mask.squeeze(0).float() + 
-                                     (1 - args.sam_weight) * clipseg_mask[i]).float()
-                        fused_mask = (fused_mask > 0.5).float()  # Threshold
-                    elif args.fusion_mode == "clipseg_only":
-                        fused_mask = clipseg_mask[i].float()
-                    else:  # sam_only
-                        fused_mask = sam_mask.squeeze(0).float()
-                    
-                    combined_mask[i] = fused_mask
+            # Get SAM2 prediction and fuse
+            fused_mask = predict_with_sam2(
+                sam2_predictor, 
+                i,
+                selected_points, 
+                clipseg_mask[i], 
+                args,
+                device
+            )
+            
+            combined_mask[i] = fused_mask
         
         # Create pseudo-label from combined mask
         pseudo_label = torch.zeros((1024, 2048), dtype=torch.uint8, device=device)
@@ -352,6 +423,39 @@ def evaluate_cityscapes_val(args):
             plt.tight_layout()
             plt.savefig(vis_path, dpi=150, bbox_inches='tight')
             plt.close(fig)
+            
+            # Additionally, save comparison between CLIPSeg and final fused results
+            if args.save_detailed_vis:
+                detail_vis_dir = os.path.join(args.output_dir, "detailed_vis", city)
+                os.makedirs(detail_vis_dir, exist_ok=True)
+                
+                detail_vis_name = file_name.replace("_leftImg8bit.png", "_detailed_vis.png")
+                detail_vis_path = os.path.join(detail_vis_dir, detail_vis_name)
+                
+                # Generate CLIPSeg mask visualization
+                clipseg_color_mask = colorize_mask(clipseg_mask)
+                
+                # Create figure with CLIPSeg, fused result, and ground truth
+                fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+                
+                # CLIPSeg mask
+                axs[0].imshow(clipseg_color_mask)
+                axs[0].set_title('CLIPSeg Mask')
+                axs[0].axis('off')
+                
+                # Fused mask
+                axs[1].imshow(color_mask)
+                axs[1].set_title('SAM2 + CLIPSeg Fusion')
+                axs[1].axis('off')
+                
+                # Ground truth
+                axs[2].imshow(gt_colored)
+                axs[2].set_title('Ground Truth')
+                axs[2].axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(detail_vis_path, dpi=150, bbox_inches='tight')
+                plt.close(fig)
     
     # Calculate per-class IoU from confusion matrix
     intersection = np.diag(confusion_matrix)
@@ -472,6 +576,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./evaluation_results",
                         help="Directory to save evaluation results")
     parser.add_argument("--save_vis", action="store_true", help="Save visualizations of the results")
+    parser.add_argument("--save_detailed_vis", action="store_true", 
+                        help="Save detailed visualizations comparing CLIPSeg and fusion results")
     
     # CLIPSeg model arguments
     parser.add_argument("--clipseg_model_name", type=str, default="CIDAS/clipseg-rd64-refined", 
