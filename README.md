@@ -1,3 +1,1 @@
-# finetune_clipseg
-# finetune_clipseg
-# finetune_clipseg
+a code for fine-tuning clip seg
