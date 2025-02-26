@@ -9,4 +9,8 @@ python finetune_clipseg.py --data_dir /media/avalocal/T7/pardis/pardis/perceptio
 
 create pseudos:
 ```
+python pseudo_labeling.py \
+  --data_dir /path/to/cityscapes \
+  --model_path /path/to/checkpoints/clipseg_finetuned_semantic_cityscapes_1e-5.pth \
+  --miou_threshold 0.3
 ```
